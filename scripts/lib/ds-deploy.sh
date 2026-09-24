@@ -17,9 +17,13 @@
 #     scripts/ коммита во временный каталог и перезапускает себя оттуда;
 #   * код едет только из `git archive <sha>` (LF, без .env и рабочих файлов);
 #   * у коммита должен быть зелёный check-run `ci` (GitHub Actions);
-#   * на сервере ведётся маркер .ds-deploy/ (DEPLOYED, MANIFEST, history):
-#     без маркера реальная выкатка отказывает (нужна разовая миграция), ручные
-#     правки файлов (дрейф) — отказ со списком файлов;
+#   * на сервере ведётся маркер .ds-deploy/ (DEPLOYED, MANIFEST, MANIFEST.ok,
+#     history): без маркера реальная выкатка отказывает (нужна разовая
+#     миграция), ручные правки файлов (дрейф) — отказ со списком файлов;
+#   * на сервер записываются только файлы, которые отличаются от выкатанных
+#     (остальные не трогаются: сохраняются inode, время и права); бит
+#     исполнения, снятый в git, у существующих файлов восстанавливается;
+#   * окно выкатки проверяется и на ПК, и на сервере прямо перед шагом pre;
 #   * все ИЗМЕНЯЮЩИЕ удалённые действия идут только через ds_run (в --dry-run
 #     она лишь печатает), все ЧТЕНИЯ с сервера — только через ds_probe.
 #
@@ -28,7 +32,7 @@
 # выключается, .env и похожие на секреты файлы не выкатываются и не хэшируются.
 # =============================================================================
 
-DS_DEPLOY_LIB_VERSION=1.0.0
+DS_DEPLOY_LIB_VERSION=1.1.0
 
 # Никакой трассировки: в командах могут оказаться имена хостов и пути ключей,
 # а в проектных хуках — что угодно.
@@ -52,11 +56,16 @@ DS_SSH_COMMON_OPTS=(
 )
 # Файлы, похожие на секреты: никогда не выкатываются, не хэшируются, не
 # удаляются. Шаблоны — от корня цели (см. «Шаблоны путей» ниже).
-# Исключение: имена, оканчивающиеся на .example.
+# Исключение: имена, оканчивающиеся на .example. Файл из git, похожий на
+# секрет, — отказ выкатки (утечка или ложное срабатывание — решает человек):
+# убрать из git, внести в DS_PRESERVE (не выкатывать) или в
+# DS_DEPLOY_SECRETLIKE (это не секрет — выкатывать).
 DS_SECRET_PATTERNS=(
   '**/.env' '**/.env.*' '**/*.pem' '**/*.key' '**/*.p12' '**/*.pfx'
-  '**/id_rsa*' '**/id_ed25519*' '**/id_ecdsa*' '**/credentials*' '**/auth*.ini'
+  '**/id_rsa*' '**/id_ed25519*' '**/id_ecdsa*' '**/auth*.ini'
+  '**/credentials' '**/credentials.json' '**/credentials.ini' '**/credentials.y*ml'
 )
+DS_FILES_LIMIT=50000           # больше файлов в каталоге цели — отказ (DS_PRESERVE)
 
 # ---------------------------------------------------------------------------
 # Вывод
@@ -92,10 +101,14 @@ _ds_usage() {
                             с --adopt — миграция с заменой отличающихся файлов
   --adopt                   разовая миграция: поставить маркер (см. DEPLOY.md)
   --adopt-sha <sha>         то же, для более старого коммита основной ветки
+                            (ci у него не нужен, пока файлы не перезаписываются)
   --rollback                вернуть предыдущий успешно выкатанный коммит
   --test-ref <ветка>        ТОЛЬКО с --dry-run: проверить ветку PR (логика и
                             файлы из origin/<ветка>) против сервера до мержа
   -h, --help                эта справка
+
+В --dry-run цели со сборкой (ds_<цель>_build) собираются на ПК во временном
+каталоге — так видно, какие файлы изменятся; сервер не меняется.
 
 Коды выхода: 0 — успех; 2 — нет цели деплоя или ошибка вызова; 3 — отказ по
 проверке (на сервере ничего не менялось); 4 — сбой во время выкатки (состояние
@@ -149,6 +162,9 @@ _ds_glob_re() {
 
 # Проверка для удалённых хуков: изменился ли хоть один путь по шаблонам.
 #   if ds_changed 'backend/**' 'docker-compose*.yml'; then ... fi
+# Список $DS_CHANGED_FILE: по пути в строке, от корня ЦЕЛИ (при DS_SUBDIR — от
+# подкаталога), включая удалённые из git файлы; при первой выкатке — все файлы;
+# после неуспешной прошлой выкатки — всё, что изменилось с последней успешной.
 ds_changed() {
   local re="" p
   for p in "$@"; do re+="${re:+|}($(_ds_glob_re "$p"))"; done
@@ -157,7 +173,7 @@ ds_changed() {
 }
 
 _ds_build_patterns() {
-  local p re=""
+  local p re="" r ed
   for p in "${DS_PRESERVE[@]}"; do re+="${re:+|}($(_ds_glob_re "$p"))"; done
   if [ "${DS_MARKER_DIR#"$DS_DIR"/}" != "$DS_MARKER_DIR" ]; then
     re+="${re:+|}($(_ds_glob_re "${DS_MARKER_DIR#"$DS_DIR"/}/"))"
@@ -166,10 +182,24 @@ _ds_build_patterns() {
   re=""
   for p in "${DS_SECRET_PATTERNS[@]}"; do re+="${re:+|}($(_ds_glob_re "$p"))"; done
   _DS_SECRET_RE=$re
-  # Каталоги без масок — find на сервере их не обходит (node_modules, data...).
-  _DS_PRUNE_DIRS=(.git)
+  re=""
+  for p in "${DS_DEPLOY_SECRETLIKE[@]}"; do re+="${re:+|}($(_ds_glob_re "$p"))"; done
+  _DS_ALLOW_RE=$re
+  # Каталоги из DS_PRESERVE find на сервере не обходит (node_modules, data...):
+  # без масок — по пути (-path), с масками — по тому же регулярному выражению,
+  # что и на ПК (-regex), чтобы не отсечь лишнего.
+  _DS_PRUNE_DIRS=(.git); _DS_PRUNE_RES=()
+  ed=$(printf '%s' "$DS_DIR" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
   for p in "${DS_PRESERVE[@]}"; do
-    case "$p" in *'*'*|*'?'*|*'['*) continue ;; */) _DS_PRUNE_DIRS+=("${p%/}") ;; esac
+    case "$p" in
+      */) ;;
+      *) continue ;;
+    esac
+    case "$p" in
+      *'*'*|*'?'*|*'['*)
+        r=$(_ds_glob_re "${p%/}"); _DS_PRUNE_RES+=("$ed/${r#^}") ;;
+      *) _DS_PRUNE_DIRS+=("${p%/}") ;;
+    esac
   done
   if [ "${DS_MARKER_DIR#"$DS_DIR"/}" != "$DS_MARKER_DIR" ]; then
     _DS_PRUNE_DIRS+=("${DS_MARKER_DIR#"$DS_DIR"/}")
@@ -177,16 +207,24 @@ _ds_build_patterns() {
 }
 
 # stdin: относительные пути → stdout: те, что сохраняются (не выкатываются и
-# не трогаются): DS_PRESERVE, маркер, похожие на секреты (кроме *.example).
+# не трогаются): DS_PRESERVE, маркер, похожие на секреты (кроме *.example и
+# DS_DEPLOY_SECRETLIKE).
 _ds_kept() {
-  DS_U="$_DS_USER_RE" DS_S="$_DS_SECRET_RE" awk '
+  DS_U="$_DS_USER_RE" DS_S="$_DS_SECRET_RE" DS_A="$_DS_ALLOW_RE" awk '
     (ENVIRON["DS_U"] != "" && $0 ~ ENVIRON["DS_U"]) ||
-    ($0 ~ ENVIRON["DS_S"] && $0 !~ /\.example$/)'
+    ($0 ~ ENVIRON["DS_S"] && $0 !~ /\.example$/ && (ENVIRON["DS_A"] == "" || $0 !~ ENVIRON["DS_A"]))'
 }
 _ds_not_kept() {
-  DS_U="$_DS_USER_RE" DS_S="$_DS_SECRET_RE" awk '
+  DS_U="$_DS_USER_RE" DS_S="$_DS_SECRET_RE" DS_A="$_DS_ALLOW_RE" awk '
     !((ENVIRON["DS_U"] != "" && $0 ~ ENVIRON["DS_U"]) ||
-      ($0 ~ ENVIRON["DS_S"] && $0 !~ /\.example$/))'
+      ($0 ~ ENVIRON["DS_S"] && $0 !~ /\.example$/ && (ENVIRON["DS_A"] == "" || $0 !~ ENVIRON["DS_A"])))'
+}
+# stdin: пути → stdout: похожие на секрет и НЕ покрытые DS_PRESERVE/DS_DEPLOY_SECRETLIKE.
+_ds_secretlike() {
+  DS_U="$_DS_USER_RE" DS_S="$_DS_SECRET_RE" DS_A="$_DS_ALLOW_RE" awk '
+    $0 ~ ENVIRON["DS_S"] && $0 !~ /\.example$/ &&
+    (ENVIRON["DS_A"] == "" || $0 !~ ENVIRON["DS_A"]) &&
+    (ENVIRON["DS_U"] == "" || $0 !~ ENVIRON["DS_U"])'
 }
 
 # ---------------------------------------------------------------------------
@@ -327,6 +365,16 @@ _ds_init_repo() {
   if [ "$DS_ENV" = prod ]; then DS_BRANCH=$DS_MAIN_BRANCH; else DS_BRANCH=develop; fi
   # Проверка ветки PR до мержа — только в --dry-run (см. _ds_parse_args).
   if [ -n "$DS_TEST_REF" ]; then DS_BRANCH=$DS_TEST_REF; fi
+  # Полигон есть только там, где есть develop. Без неё — «деплоя нет» (код 2),
+  # а не ошибка git fetch. Код 2 от ls-remote — «ветки нет»; сбой сети — дальше.
+  if [ "$DS_ENV" = staging ] && [ -z "$DS_TEST_REF" ]; then
+    local rc=0
+    ds_git ls-remote --exit-code --heads origin develop >/dev/null 2>&1 || rc=$?
+    if [ "$rc" = 2 ]; then
+      ds_info "Деплоя нет: у проекта нет полигона (на origin нет ветки develop)"
+      exit 2
+    fi
+  fi
 }
 
 # git fetch в собственную ссылку refs/ds-deploy/<ветка>: локальные ветки,
@@ -474,7 +522,7 @@ ds_run() {  # <описание> <команда> [аргументы...]
 # Чтение состояния сервера (только чтение)
 # ---------------------------------------------------------------------------
 _ds_probe_state_script() {
-  declare -p DS_DIR DS_SUDO DS_MARKER_DIR _DS_PRUNE_DIRS
+  declare -p DS_DIR DS_SUDO DS_MARKER_DIR _DS_PRUNE_DIRS _DS_PRUNE_RES DS_FILES_LIMIT
   cat <<'EOF'
 SUDO=""; if [ "$DS_SUDO" = 1 ]; then SUDO="sudo -n"; fi
 M=$DS_MARKER_DIR
@@ -483,6 +531,8 @@ echo "@@DIREXISTS"; if $SUDO test -d "$DS_DIR"; then echo yes; else echo no; fi
 echo "@@DEPLOYED"; $SUDO cat "$M/DEPLOYED" 2>/dev/null || true
 echo "@@HISTORY"; $SUDO tail -n 50 "$M/history" 2>/dev/null || true
 echo "@@OLDMAN"; $SUDO cat "$M/MANIFEST" 2>/dev/null || true
+echo "@@OKFLAG"; if $SUDO test -f "$M/MANIFEST.ok"; then echo yes; else echo no; fi
+echo "@@OKMAN"; $SUDO cat "$M/MANIFEST.ok" 2>/dev/null || true
 echo "@@DRIFTRAW"
 if $SUDO test -f "$M/MANIFEST"; then
   $SUDO cat "$M/MANIFEST" | awk -v p="$DS_DIR/" '{ print substr($0, 1, 64) "  " p substr($0, 67) }' \
@@ -496,8 +546,9 @@ echo "@@FILES"
 if $SUDO test -d "$DS_DIR"; then
   args=(-path "$DS_DIR/.git")
   for p in "${_DS_PRUNE_DIRS[@]}"; do args+=(-o -path "$DS_DIR/$p"); done
-  $SUDO find "$DS_DIR" -xdev \( "${args[@]}" \) -prune -o -type f -printf '%P\n' 2>/dev/null \
-    | LC_ALL=C sort | head -n 50000 || true
+  for p in "${_DS_PRUNE_RES[@]}"; do args+=(-o "(" -type d -regex "$p" ")"); done
+  $SUDO find "$DS_DIR" -xdev -regextype posix-extended \( "${args[@]}" \) -prune -o -type f -printf '%P\n' 2>/dev/null \
+    | head -n "$((DS_FILES_LIMIT + 1))" | LC_ALL=C sort || true
 fi
 echo "@@END"
 EOF
@@ -529,7 +580,7 @@ _ds_load_target() {
   DS_SUDO=0; DS_CHOWN=""; DS_MARKER_DIR=""; DS_SUBDIR=""; DS_BUILD_OUT=""
   DS_KNOWN_HOSTS=""; DS_ADOPT_MODE=verify
   DS_WINDOW=$_DS_ENV_WINDOW; DS_MIN_FREE_MB=$_DS_ENV_MIN_FREE
-  DS_PRESERVE=(); DS_EXPORT=()
+  DS_PRESERVE=(); DS_EXPORT=(); DS_DEPLOY_SECRETLIKE=()
   declare -F "ds_target_$t" >/dev/null || ds_die "в scripts/deploy.sh нет функции ds_target_$t"
   "ds_target_$t"
   DS_DIR=${DS_DIR%/}
@@ -549,8 +600,13 @@ _ds_load_target() {
   case "$DS_ADOPT_MODE" in verify|replace) ;; *) ds_die "цель $t: DS_ADOPT_MODE — verify или replace" ;; esac
   [[ $DS_MIN_FREE_MB =~ ^[0-9]+$ ]] || ds_die "цель $t: DS_MIN_FREE_MB — число МБ"
   [ -n "$DS_MARKER_DIR" ] || DS_MARKER_DIR="$DS_DIR/.ds-deploy"
-  case "$DS_MARKER_DIR" in
-    /var/www/*|*/public/*|*/site/*|*/html/*)
+  # Маркер не должен быть виден из веба. /var/www/<логин>/data — домашний
+  # каталог shared-хостинга (ISPmanager), веб-корни там — .../data/www/<сайт>.
+  case "$DS_MARKER_DIR/" in
+    */public_html/*|*/public/*|*/html/*|*/site/*|*/htdocs/*|*/wwwroot/*|*/data/www/*)
+      ds_warn "цель $t: маркер $DS_MARKER_DIR, похоже, в веб-корне — задайте DS_MARKER_DIR вне него" ;;
+    /var/www/*/data/*) ;;
+    /var/www/*)
       ds_warn "цель $t: маркер $DS_MARKER_DIR, похоже, в веб-корне — задайте DS_MARKER_DIR вне него" ;;
   esac
   if [ -z "$DS_KNOWN_HOSTS" ]; then
@@ -580,15 +636,11 @@ _ds_make_payload() {  # <sha> <каталог плана>
   _DS_PAYLOAD_OK=0
   : > "$P/excluded.lst"
   if declare -F "ds_${DS_TARGET}_build" >/dev/null; then
-    if [ "$DS_DRY" = 1 ]; then
-      ds_info "  сборка ds_${DS_TARGET}_build в --dry-run пропущена: список изменений цели будет известен при выкатке"
-      : > "$P/new.man"; echo 1 > "$P/nobuild"
-      _DS_PAYLOAD_OK=1
-      return 0
-    fi
+    # Сборка и в --dry-run: она локальная, во временном каталоге, сервер не
+    # трогает — зато dry-run показывает настоящие изменения и сверку миграции.
     mkdir -p "$P/src"
     ds_git -c core.autocrlf=false -c core.eol=lf archive --format=tar "$sha" | tar -x -C "$P/src" -f -
-    ds_info "  сборка ds_${DS_TARGET}_build из архива ${sha:0:9} (не из рабочей копии)…"
+    ds_info "  сборка ds_${DS_TARGET}_build из архива ${sha:0:9} (не из рабочей копии; на ПК)…"
     set +e
     (set -e; cd "$P/src"; "ds_${DS_TARGET}_build")
     rc=$?
@@ -604,13 +656,29 @@ _ds_make_payload() {  # <sha> <каталог плана>
     [ -z "$DS_SUBDIR" ] || tree="$sha:$DS_SUBDIR"
     ds_git -c core.autocrlf=false -c core.eol=lf archive --format=tar "$tree" > "$P/payload.tar" \
       || { _ds_block "$DS_TARGET: git archive $tree не удался"; return 0; }
-    tar -tf "$P/payload.tar" | grep -v '/$' | _ds_kept > "$P/excluded.lst" || true
+    tar -tf "$P/payload.tar" | grep -v '/$' | LC_ALL=C sort > "$P/git.lst" || true
+    # Файл из git, похожий на секрет: утечка или ложное срабатывание — решает человек.
+    _ds_secretlike < "$P/git.lst" > "$P/secretlike.lst" || true
+    if [ -s "$P/secretlike.lst" ]; then
+      _ds_show_list "ФАЙЛЫ ИЗ GIT ПОХОЖИ НА СЕКРЕТ" "$P/secretlike.lst"
+      _ds_block "$DS_TARGET: в git есть файлы, похожие на секрет — уберите их из git (если это секрет), либо DS_PRESERVE (не выкатывать), либо DS_DEPLOY_SECRETLIKE (не секрет — выкатывать)"
+      return 0
+    fi
+    _ds_kept < "$P/git.lst" > "$P/excluded.lst" || true
     if [ -s "$P/excluded.lst" ]; then
       tar --delete -f "$P/payload.tar" -T "$P/excluded.lst"
     fi
     mkdir -p "$P/pl"
     tar -x -C "$P/pl" -f "$P/payload.tar"
     _ds_manifest_of "$P/pl" > "$P/new.man"
+    # Скрипты без бита исполнения в git: на сервере у существующих файлов бит
+    # восстанавливается, но новые файлы придут без него.
+    tar -tvf "$P/payload.tar" \
+      | awk '$1 ~ /^-/ && $1 !~ /x/ && $NF ~ /\.sh$/ && $NF !~ /^scripts\/(lib\/|deploy\.sh$)/ { print $NF }' \
+      > "$P/noexec.lst" || true
+    if [ -s "$P/noexec.lst" ]; then
+      ds_warn "$DS_TARGET: .sh без бита исполнения в git ($(wc -l < "$P/noexec.lst" | tr -d ' ')): поставьте git update-index --chmod=+x <файл> (например $(head -n 1 "$P/noexec.lst"))"
+    fi
   fi
   if grep -q '^\\' "$P/new.man"; then
     _ds_block "$DS_TARGET: имена файлов с «\\» или переводом строки не поддерживаются"
@@ -633,8 +701,16 @@ _ds_show_list() {  # <заголовок> <файл>
   [ "$n" -le "$lim" ] || ds_info "      … и ещё $((n - lim)) (полный список: --drift)"
 }
 
+_ds_man_diff() {  # <старый манифест> <новый манифест> → «A|M|D<TAB>путь»
+  awk 'FILENAME == ARGV[1] { o[substr($0, 67)] = substr($0, 1, 64); next }
+       { p = substr($0, 67); s[p] = 1
+         if (!(p in o)) print "A\t" p; else if (o[p] != substr($0, 1, 64)) print "M\t" p }
+       END { for (p in o) if (!(p in s)) print "D\t" p }' "$1" "$2" \
+    | LC_ALL=C sort -t "$(printf '\t')" -k2
+}
+
 _ds_plan_target() {
-  local t=$1 P="$_DS_W/$1" prev prev_result mode sha now rc cand free
+  local t=$1 P="$_DS_W/$1" prev prev_result mode sha now rc cand free nfiles
   mkdir -p "$P"
   _ds_load_target "$t"
   ds_info ""
@@ -651,6 +727,11 @@ _ds_plan_target() {
     return 0
   fi
   if [ "$(cat "$P/sudo")" != ok ]; then _ds_block "$t: sudo -n на сервере не работает"; fi
+  nfiles=$(wc -l < "$P/files" | tr -d ' ')
+  if [ "$nfiles" -gt "$DS_FILES_LIMIT" ]; then
+    _ds_block "$t: в $DS_DIR больше $DS_FILES_LIMIT файлов вне DS_PRESERVE — сверка неполная; добавьте каталоги данных (data/, node_modules/, …) в DS_PRESERVE"
+    return 0
+  fi
   prev=$(sed -n 's/^sha=//p' "$P/deployed")
   prev_result=$(sed -n 's/^result=//p' "$P/deployed")
 
@@ -671,6 +752,8 @@ _ds_plan_target() {
     if [ "$DS_ENV" = staging ] && [ "$DS_ADOPT_MODE" = replace ]; then
       mode=adopt-replace
       ds_warn "$t: на полигоне нет маркера — первая выкатка перезапишет файлы из git (DS_ADOPT_MODE=replace)"
+    elif [ "$DS_ADOPT_MODE" = replace ]; then
+      _ds_block "$t: сервер не мигрирован (нет маркера ${DS_MARKER_DIR}) — первая выкатка с заменой файлов (DS_ADOPT_MODE=replace) на $DS_ENV только явно: scripts/deploy.sh $DS_ENV --only $t --adopt"
     else
       _ds_block "$t: сервер не мигрирован (нет маркера ${DS_MARKER_DIR}) — выполните разовую миграцию по DEPLOY.md, затем scripts/deploy.sh $DS_ENV --adopt"
     fi
@@ -686,11 +769,14 @@ _ds_plan_target() {
     sha=$cand; mode=rollback
     ds_info "  откат: ${prev:0:9} → ${sha:0:9}"
   fi
-  if [ "$sha" != "$DS_REEXEC" ]; then _ds_ci_gate "$sha"; fi
   ds_info "  коммит: $(ds_git log -1 --format='%h %ad %s' --date=short "$sha")"
   if [ -n "$prev" ]; then
     ds_info "  на сервере: ${prev:0:9} (результат: ${prev_result:-?})"
-    [ "$prev_result" != pending ] || ds_warn "$t: прошлая выкатка оборвалась (result=pending) — сверяю файлы"
+    case "$prev_result" in
+      ok|adopted) ;;
+      pending) ds_warn "$t: прошлая выкатка оборвалась (result=pending) — сверяю файлы; хукам — все изменения с последней успешной выкатки" ;;
+      *) ds_warn "$t: прошлая выкатка не завершилась успешно (result=${prev_result:-?}) — хукам передаются все изменения с последней успешной выкатки (DS_PREV_RESULT)" ;;
+    esac
     if [ "$prev" = "$sha" ] && [ "$mode" = deploy ]; then
       ds_info "  на сервере уже этот коммит — выкатка повторит шаги pre/post/health"
     fi
@@ -709,16 +795,24 @@ _ds_plan_target() {
   cut -c67- "$P/oldman" > "$P/old.paths"
   awk -v p="$DS_DIR/" 'index($0, p) == 1 { s = substr($0, length(p) + 1); sub(/: FAILED( open or read)?$/, "", s); print s }' \
     "$P/driftraw" | LC_ALL=C sort -u > "$P/drift0.lst"
+  # diff.txt: чем новый коммит отличается от того, что лежит на сервере (MANIFEST).
   if [ -n "$prev" ]; then
-    awk 'NR == FNR { o[substr($0, 67)] = substr($0, 1, 64); next }
-         { p = substr($0, 67); s[p] = 1
-           if (!(p in o)) print "A\t" p; else if (o[p] != substr($0, 1, 64)) print "M\t" p }
-         END { for (p in o) if (!(p in s)) print "D\t" p }' "$P/oldman" "$P/new.man" \
-      | LC_ALL=C sort -t "$(printf '\t')" -k2 > "$P/diff.txt"
+    _ds_man_diff "$P/oldman" "$P/new.man" > "$P/diff.txt"
   else
     sed 's/^/A\t/' "$P/new.paths" > "$P/diff.txt"
   fi
   cut -f2- "$P/diff.txt" > "$P/changed.lst"
+  # Для хуков (ds_changed): после неуспешной прошлой выкатки — всё, что
+  # изменилось с последней успешной (MANIFEST.ok), иначе шаги post/health
+  # решат, что «ничего не менялось», и не поднимут остановленное.
+  if [ -n "$prev" ] && [ "$prev_result" != ok ] && [ "$prev_result" != adopted ]; then
+    if [ "$(cat "$P/okflag" 2>/dev/null)" = yes ]; then
+      _ds_man_diff "$P/okman" "$P/new.man" | cut -f2- | LC_ALL=C sort -u - "$P/changed.lst" > "$P/changed.tmp"
+    else
+      grep '^D' "$P/diff.txt" | cut -f2- | LC_ALL=C sort -u - "$P/new.paths" > "$P/changed.tmp" || true
+    fi
+    mv -f "$P/changed.tmp" "$P/changed.lst"
+  fi
   grep '^D' "$P/diff.txt" | cut -f2- | _ds_not_kept > "$P/prune.lst" || true
   # Хэши на сервере нужны для: дрейфа, новых для маркера файлов, миграции.
   { cat "$P/drift0.lst"; grep '^A' "$P/diff.txt" | cut -f2- || true; } | LC_ALL=C sort -u \
@@ -751,20 +845,11 @@ _ds_plan_target() {
   LC_ALL=C sort -u "$P/new.paths" "$P/old.paths" | LC_ALL=C comm -23 "$P/files" - | _ds_not_kept > "$P/extras.lst" || true
   LC_ALL=C comm -23 "$P/new.paths" "$P/files" > "$P/missing.lst"
   cat "$P/drift.lst" "$P/conflict.lst" | LC_ALL=C sort -u | LC_ALL=C comm -12 - "$P/files" > "$P/backup.lst"
-  if [ -f "$P/nobuild" ]; then
-    # --dry-run без сборки: новый манифест неизвестен — сравнивать не с чем.
-    : > "$P/diff.txt"; : > "$P/changed.lst"; : > "$P/prune.lst"; : > "$P/extras.lst"
-    : > "$P/conflict.lst"; : > "$P/missing.lst"; : > "$P/backup.lst"
-    awk -v F="$P/files" 'BEGIN { while ((getline l < F) > 0) fs[l] = 1 } ($0 in fs)' "$P/drift0.lst" > "$P/drift.lst"
-    ds_info "  без сборки проверены только дрейф, место и окно; полная сверка — при реальном запуске"
-  fi
 
   # 5. Проверки и отчёт.
-  if [ -f "$P/nobuild" ]; then
-    :
-  elif [ -n "$prev" ] && [ "$mode" != adopt-verify ]; then
+  if [ -n "$prev" ] && [ "$mode" != adopt-verify ]; then
     ds_info "  изменения: +$(grep -c '^A' "$P/diff.txt" || true) ~$(grep -c '^M' "$P/diff.txt" || true) -$(wc -l < "$P/prune.lst" | tr -d ' ') файлов"
-    if [ -n "$prev" ] && ds_git cat-file -e "$prev^{commit}" 2>/dev/null; then
+    if ds_git cat-file -e "$prev^{commit}" 2>/dev/null; then
       ds_git log --oneline --no-decorate "$prev..$sha" | head -n 15 | sed 's/^/      /'
     fi
     [ "$DS_VERBOSE" = 0 ] || _ds_show_list "файлы" "$P/diff.txt"
@@ -810,11 +895,36 @@ _ds_plan_target() {
       fi ;;
     adopt-replace)
       ds_info "  первая выкатка без маркера: будет записано файлов $(wc -l < "$P/new.paths" | tr -d ' ')"
-      _ds_show_list "будут перезаписаны (отличаются)" "$P/conflict.lst" ;;
+      _ds_show_list "будут перезаписаны (отличаются)" "$P/conflict.lst"
+      _ds_show_list "чужие файлы на сервере (не трогаются)" "$P/extras.lst" ;;
   esac
   if [ "$mode" != adopt-verify ] && [ -n "$prev" ]; then
     _ds_show_list "чужие файлы на сервере (не трогаются)" "$P/extras.lst"
     [ ! -s "$P/prune.lst" ] || [ "$DS_VERBOSE" = 1 ] || _ds_show_list "будут удалены (убраны из git)" "$P/prune.lst"
+  fi
+  # Что записывается на сервер: только отличающееся от выкатанного. Остальные
+  # файлы не трогаются (их содержимое совпадает — это проверяет дрейф).
+  case "$mode" in
+    adopt-verify) : > "$P/write.lst" ;;
+    adopt-replace) cp "$P/new.paths" "$P/write.lst" ;;
+    *)
+      if [ -z "$prev" ]; then
+        cp "$P/new.paths" "$P/write.lst"
+      else
+        { grep -E '^(A|M)' "$P/diff.txt" | cut -f2- || true
+          LC_ALL=C comm -12 "$P/drift.lst" "$P/new.paths" 2>/dev/null || true
+          cat "$P/missing.lst"; } | LC_ALL=C sort -u > "$P/write.lst"
+      fi ;;
+  esac
+  # ci: у коммита, файлы которого пишутся на сервер. --adopt-sha без замены
+  # файлов только ставит маркер — ci старого коммита не нужен (логика
+  # выкатки — из origin/<ветка>, её ci проверен в ds_main).
+  if [ "$sha" != "$DS_REEXEC" ]; then
+    if [ "$mode" = adopt-verify ]; then
+      ds_info "  ci у ${sha:0:9} не требуется: только маркер, файлы и сервисы не трогаются"
+    else
+      _ds_ci_gate "$sha"
+    fi
   fi
   # Место на диске.
   free=$(head -n 1 "$P/free")
@@ -827,7 +937,7 @@ _ds_plan_target() {
       ds_info "  свободно на сервере: $free МБ (минимум $DS_MIN_FREE_MB)"
     fi
   fi
-  # Окно выкатки.
+  # Окно выкатки (ещё раз — на сервере, перед шагом pre).
   now=$(date -u +%s); rc=0
   _ds_in_window "$DS_WINDOW" "$now" || rc=$?
   if [ "$rc" = 2 ]; then
@@ -842,13 +952,14 @@ _ds_plan_target() {
     _ds_block "$t: сейчас $(_ds_msk_now) — вне разрешённого окна «$DS_WINDOW»"
   fi
   if [ "$mode" != adopt-verify ]; then
+    ds_info "  будет записано на сервер: $(wc -l < "$P/write.lst" | tr -d ' ') файлов (остальные не трогаются)"
     if declare -F "ds_${t}_remote_post" >/dev/null; then
       ds_info "  после распаковки: ds_${t}_remote_post (сборка/перезапуск — см. scripts/deploy.sh)"
     else
       ds_info "  после распаковки: ничего не перезапускается"
     fi
   fi
-  printf 'DS_P_SHA=%q\nDS_P_PREV=%q\nDS_P_MODE=%q\n' "$sha" "$prev" "$mode" > "$P/plan.env"
+  printf 'DS_P_SHA=%q\nDS_P_PREV=%q\nDS_P_MODE=%q\nDS_P_PREV_RESULT=%q\n' "$sha" "$prev" "$mode" "$prev_result" > "$P/plan.env"
   return 0
 }
 
@@ -858,10 +969,11 @@ _ds_plan_target() {
 _ds_vars_script() {
   local f v
   declare -p DS_ENV DS_TARGET DS_SHA DS_EXPECT_PREV DS_DIR DS_SUDO DS_CHOWN \
-    DS_MARKER_DIR DS_MIN_FREE_MB DS_MODE DS_OPERATOR DS_REMOTE_LOCK
+    DS_MARKER_DIR DS_MIN_FREE_MB DS_MODE DS_OPERATOR DS_REMOTE_LOCK \
+    DS_PREV_RESULT DS_WINDOW DS_WINDOW_CHECK DS_MSK_OFFSET DS_PC_HEALTH DS_FINAL
   printf 'DS_REPO=%q\nDS_LIB_VERSION=%q\n' "$DS_GH_REPO" "$DS_DEPLOY_LIB_VERSION"
   for v in "${DS_EXPORT[@]}"; do declare -p "$v"; done
-  declare -f _ds_glob_re ds_changed
+  declare -f _ds_glob_re ds_changed _ds_in_window _ds_day_in _ds_day_num
   for f in $(compgen -A function | grep -E "^ds_(${DS_TARGET}_remote_|remote_)" || true); do
     declare -f "$f"
   done
@@ -870,14 +982,22 @@ _ds_vars_script() {
 _ds_runner_script() {
   cat <<'DS_RUNNER_EOF'
 # ds-deploy: исполняется на сервере в одной SSH-сессии, под общим локом.
+# Коды выхода: 20 — файлы изменились с момента проверки; 21 — маркер изменился;
+# 23 — лок занят; 24 — мало места; 25 — вне окна выкатки; 30 — шаг pre упал
+# (файлы не менялись); 31 — шаг post упал; 32 — здоровье не прошло.
 set -euo pipefail
 S=$1
 . "$S/ctl/vars.sh"
 SUDO=""; if [ "$DS_SUDO" = 1 ]; then SUDO="sudo -n"; fi
 DS_SUDO_CMD=$SUDO
 DS_PREV_SHA=$DS_EXPECT_PREV
+DS_FIRST_DEPLOY=0; if [ -z "$DS_EXPECT_PREV" ]; then DS_FIRST_DEPLOY=1; fi
 DS_CHANGED_FILE="$S/ctl/CHANGED"
-export DS_SUDO_CMD DS_PREV_SHA DS_CHANGED_FILE
+DS_PKG_DIR=$S
+DS_PAYLOAD="$S/payload.tar"
+DS_STATE_FILE="$S/ctl/STATE"
+: > "$DS_STATE_FILE"
+export DS_SUDO_CMD DS_PREV_SHA DS_PREV_RESULT DS_FIRST_DEPLOY DS_CHANGED_FILE DS_PKG_DIR DS_PAYLOAD DS_STATE_FILE
 M=$DS_MARKER_DIR
 _lockdir=""
 _cleanup() { if [ -n "$_lockdir" ]; then rmdir "$_lockdir" 2>/dev/null || true; fi; rm -rf -- "$S"; }
@@ -902,6 +1022,9 @@ _history() {
     | tail -n 50 | $SUDO tee "$M/history.new" >/dev/null
   $SUDO mv -f "$M/history.new" "$M/history"
 }
+# Манифест последней УСПЕШНОЙ выкатки: от него считается CHANGED для хуков,
+# если следующая выкатка идёт после неуспешной.
+_mark_ok_manifest() { $SUDO cp "$M/MANIFEST" "$M/MANIFEST.ok.new"; $SUDO mv -f "$M/MANIFEST.ok.new" "$M/MANIFEST.ok"; }
 _hook() {  # вызывать только как отдельную команду (не в if/&&/||): иначе set -e в хуке не работает
   local fn="ds_${DS_TARGET}_remote_$1" rc
   declare -F "$fn" >/dev/null || return 0
@@ -935,6 +1058,19 @@ if [ "$cur" != "$DS_EXPECT_PREV" ]; then
   exit 21
 fi
 
+# Итог после проверки здоровья с ПК (ds_<цель>_health): server-ok → ok | health-failed.
+if [ "$DS_MODE" = finalize ]; then
+  cur=$($SUDO sed -n 's/^result=//p' "$M/DEPLOYED")
+  if [ "$cur" != server-ok ]; then echo "в маркере result=$cur, а ожидался server-ok" >&2; exit 21; fi
+  DS_MODE=$($SUDO sed -n 's/^mode=//p' "$M/DEPLOYED")
+  $SUDO sed "s/^result=.*/result=$DS_FINAL/" "$M/DEPLOYED" | $SUDO tee "$M/DEPLOYED.new" >/dev/null
+  $SUDO mv -f "$M/DEPLOYED.new" "$M/DEPLOYED"
+  if [ "$DS_FINAL" = ok ]; then _mark_ok_manifest; fi
+  _history "$DS_FINAL"
+  say "итог в маркере: $DS_FINAL"
+  exit 0
+fi
+
 if [ "$DS_MODE" = adopt-verify ]; then
   if ! awk -v p="$DS_DIR/" '{ print substr($0, 1, 64) "  " p substr($0, 67) }' "$S/ctl/MANIFEST" \
        | $SUDO sha256sum -c --quiet - >/dev/null 2>&1; then
@@ -943,6 +1079,7 @@ if [ "$DS_MODE" = adopt-verify ]; then
   fi
   $SUDO mkdir -p "$M"
   $SUDO cp "$S/ctl/MANIFEST" "$M/MANIFEST.new"; $SUDO mv -f "$M/MANIFEST.new" "$M/MANIFEST"
+  _mark_ok_manifest
   _write_deployed adopted
   _history adopted
   say "маркер поставлен: $DS_SHA (ничего не перезаписано и не перезапущено)"
@@ -971,8 +1108,23 @@ if [ "${free:-0}" -lt "$DS_MIN_FREE_MB" ]; then
   exit 24
 fi
 
+# Окно выкатки — ещё раз, прямо перед остановками и перезапуском: между
+# проверкой на ПК и этим местом могли пройти подтверждение, сборка и ожидание лока.
+if [ "$DS_WINDOW_CHECK" = 1 ]; then
+  _wrc=0; _ds_in_window "$DS_WINDOW" "$(date -u +%s)" || _wrc=$?
+  if [ "$_wrc" != 0 ]; then
+    echo "сейчас $(date -u -d "@$(($(date -u +%s) + DS_MSK_OFFSET))" '+%H:%M') МСК — вне окна «$DS_WINDOW»; ничего не менялось" >&2
+    exit 25
+  fi
+fi
+
 set +e; _hook pre; rc=$?; set -e
-if [ "$rc" != 0 ]; then echo "шаг pre упал (код $rc) — файлы не менялись" >&2; exit 30; fi
+if [ "$rc" != 0 ]; then
+  # ds_<цель>_remote_abort: вернуть то, что pre успел остановить.
+  set +e; _hook abort; set -e
+  echo "шаг pre упал (код $rc) — файлы не менялись" >&2
+  exit 30
+fi
 
 $SUDO mkdir -p "$DS_DIR" "$M"
 if [ -s "$S/ctl/BACKUP" ]; then
@@ -981,10 +1133,29 @@ if [ -s "$S/ctl/BACKUP" ]; then
   say "копия файлов с ручными правками: $bk"
 fi
 _write_deployed pending
-# Распаковка поверх: --overwrite пишет в существующий файл (inode сохраняется),
-# поэтому одиночные bind-маунты (Caddyfile, config.toml) видят новое содержимое.
+# Пишутся только файлы из WRITE (отличаются от выкатанных); остальные не
+# трогаются вовсе. Распаковка поверх: --overwrite пишет в существующий файл
+# (inode сохраняется), поэтому одиночные bind-маунты (Caddyfile, config.toml)
+# видят новое содержимое. --touch: время записанных файлов — «сейчас», чтобы
+# make/ninja на сервере пересобрали изменённое (и при откате тоже).
 # Никаких mv/rename для файлов проекта.
-$SUDO tar -x --overwrite --no-same-owner -f "$S/payload.tar" -C "$DS_DIR"
+if [ -s "$S/ctl/WRITE" ]; then
+  # Бит исполнения: git с Windows часто хранит скрипты как 100644. Если файл на
+  # сервере был исполняемым, а в пакете — нет, режим восстанавливается.
+  _abs "$S/ctl/WRITE" | tr '\n' '\0' | $SUDO xargs -0 -r stat -c '%a %n' -- 2>/dev/null \
+    | awk '{ m = $1; o = substr(m, length(m) - 2, 1); if (o % 2 == 1) print }' > "$S/ctl/EXEC_BEFORE" || true
+  tr '\n' '\0' < "$S/ctl/WRITE" > "$S/ctl/WRITE0"
+  $SUDO tar -x --overwrite --no-same-owner --touch --no-wildcards -f "$S/payload.tar" -C "$DS_DIR" --null -T "$S/ctl/WRITE0"
+  while read -r _m _f; do
+    [ -n "$_f" ] || continue
+    _c=$($SUDO stat -c '%a' -- "$_f" 2>/dev/null) || continue
+    if [ $(( ${_c: -3:1} % 2 )) = 0 ]; then
+      $SUDO chmod "$_m" -- "$_f"
+      say "бит исполнения восстановлен (в git файл без +x — git update-index --chmod=+x): ${_f#"$DS_DIR"/}"
+    fi
+  done < "$S/ctl/EXEC_BEFORE"
+fi
+say "записано файлов: $(wc -l < "$S/ctl/WRITE" | tr -d ' ')"
 if [ -n "$DS_CHOWN" ]; then
   awk -v p="$DS_DIR/" '{ print p $0; n = split($0, a, "/"); d = ""
        for (i = 1; i < n; i++) { d = d (i > 1 ? "/" : "") a[i]; print p d } }' "$S/ctl/PATHS" \
@@ -1001,36 +1172,64 @@ set +e; _hook post; rc=$?; set -e
 if [ "$rc" != 0 ]; then _write_deployed post-failed; _history post-failed; echo "шаг post упал (код $rc)" >&2; exit 31; fi
 set +e; _hook health; rc=$?; set -e
 if [ "$rc" != 0 ]; then _write_deployed health-failed; _history health-failed; echo "проверка здоровья не прошла (код $rc)" >&2; exit 32; fi
-_write_deployed ok
-_history ok
-say "готово: $DS_SHA"
+if [ "$DS_PC_HEALTH" = 1 ]; then
+  # Итог ok ставится только после проверки с ПК (отдельный короткий вызов).
+  _write_deployed server-ok
+  _history server-ok
+  say "на сервере готово: $DS_SHA — жду проверку здоровья с ПК"
+else
+  _mark_ok_manifest
+  _write_deployed ok
+  _history ok
+  say "готово: $DS_SHA"
+fi
 DS_RUNNER_EOF
 }
 
-_ds_apply_target() {  # <цель>; возвращает код для журнала
-  local t=$1 P="$_DS_W/$1" rc desc
+# Отправить пакет на сервер: ЕДИНСТВЕННЫЙ путь изменений — через ds_run.
+_ds_send_pkg() {  # <каталог пакета> <описание>
+  local P=$1 rc
+  _ds_runner_script > "$P/pkg/ctl/run.sh"
+  _ds_vars_script > "$P/pkg/ctl/vars.sh"
+  (cd "$P/pkg" && tar -cf "$P/package.tar" ctl payload.tar)
+  set +e
+  ds_run "$2" _ds_transport_apply "$P/package.tar"
+  rc=$?
+  set -e
+  _DS_APPLY_RC=$rc
+  return 0
+}
+
+_ds_apply_target() {  # <цель>; код — в _DS_APPLY_RC
+  local t=$1 P="$_DS_W/$1" desc
   _ds_load_target "$t"
   # shellcheck disable=SC1091
   . "$P/plan.env"
-  DS_SHA=$DS_P_SHA; DS_EXPECT_PREV=$DS_P_PREV; DS_MODE=$DS_P_MODE
-  mkdir -p "$P/pkg/ctl"
+  DS_SHA=$DS_P_SHA; DS_EXPECT_PREV=$DS_P_PREV; DS_MODE=$DS_P_MODE; DS_PREV_RESULT=$DS_P_PREV_RESULT
+  DS_FINAL=""; DS_WINDOW_CHECK=0; DS_PC_HEALTH=0
+  if [ -z "$DS_IGNORE_WINDOW" ] && [ "$DS_MODE" != adopt-verify ]; then DS_WINDOW_CHECK=1; fi
+  if declare -F "ds_${t}_health" >/dev/null && [ "$DS_MODE" != adopt-verify ]; then DS_PC_HEALTH=1; fi
+  rm -rf "$P/pkg"; mkdir -p "$P/pkg/ctl"
   cp "$P/new.man" "$P/pkg/ctl/MANIFEST"
   cp "$P/new.paths" "$P/pkg/ctl/PATHS"
+  cp "$P/write.lst" "$P/pkg/ctl/WRITE"
   cp "$P/prune.lst" "$P/pkg/ctl/PRUNE"
   cp "$P/changed.lst" "$P/pkg/ctl/CHANGED"
   cp "$P/drift0.lst" "$P/pkg/ctl/DRIFT0"
   if [ -n "$DS_OVERWRITE_DRIFT" ]; then cp "$P/backup.lst" "$P/pkg/ctl/BACKUP"; else : > "$P/pkg/ctl/BACKUP"; fi
   if [ -f "$P/payload.tar" ]; then cp "$P/payload.tar" "$P/pkg/payload.tar"; else tar -cf "$P/pkg/payload.tar" -T /dev/null; fi
-  _ds_runner_script > "$P/pkg/ctl/run.sh"
-  _ds_vars_script > "$P/pkg/ctl/vars.sh"
-  (cd "$P/pkg" && tar -cf "$P/package.tar" ctl payload.tar)
   if [ "$DS_HOST" = local ]; then desc="$DS_MODE ${DS_SHA:0:9} → $DS_DIR"; else desc="$DS_MODE ${DS_SHA:0:9} → $DS_USER@$DS_HOST:$DS_DIR"; fi
-  set +e
-  ds_run "$desc" _ds_transport_apply "$P/package.tar"
-  rc=$?
-  set -e
-  _DS_APPLY_RC=$rc
-  return 0
+  _ds_send_pkg "$P" "$desc"
+}
+
+# Итог после проверки здоровья с ПК: маркер server-ok → ok | health-failed.
+_ds_finalize_target() {  # <цель> <ok|health-failed>; код — в _DS_APPLY_RC
+  local t=$1 P="$_DS_W/$1.final"
+  _ds_load_target "$t"
+  DS_EXPECT_PREV=$DS_SHA; DS_MODE=finalize; DS_FINAL=$2; DS_WINDOW_CHECK=0; DS_PC_HEALTH=0
+  rm -rf "$P/pkg"; mkdir -p "$P/pkg/ctl"
+  tar -cf "$P/pkg/payload.tar" -T /dev/null
+  _ds_send_pkg "$P" "итог в маркере: $2 (${DS_SHA:0:9})"
 }
 
 # ---------------------------------------------------------------------------
@@ -1086,7 +1285,7 @@ ds_main() {
     _ds_reexec "$@"   # не возвращается
   fi
   _ds_verify_reexec
-  _DS_W=""; _DS_LOCAL_LOCK=""
+  _DS_W=""; _DS_LOCAL_LOCK=""; DS_PREV_RESULT=""; DS_FINAL=""; DS_WINDOW_CHECK=0; DS_PC_HEALTH=0
   trap _ds_cleanup EXIT
   trap 'exit 130' INT TERM
   DS_STATE_DIR=${DS_STATE_DIR:-$HOME/.delta-deploy}
@@ -1126,7 +1325,10 @@ ds_main() {
   if [ "$DS_DRY" = 0 ]; then _ds_lock_local; fi
   _DS_W=$(_ds_mktemp ds-deploy-work)
 
-  if [ "$DS_ROLLBACK" = 0 ] && [ -z "$DS_ADOPT_SHA" ]; then _ds_ci_gate "$DS_REEXEC"; fi
+  # ci у коммита с логикой выкатки (и с файлами, если это не --adopt-sha и не
+  # --rollback — там коммит файлов проверяется в плане цели). При --rollback
+  # ci головы ветки не требуется: откат не должен зависеть от сломанной головы.
+  if [ "$DS_ROLLBACK" = 0 ]; then _ds_ci_gate "$DS_REEXEC"; fi
   for t in "${_DS_SEL[@]}"; do
     _ds_plan_target "$t"
   done
@@ -1146,8 +1348,9 @@ ds_main() {
 
   if [ "$DS_ENV" = prod ] && [ "$DS_YES" = 0 ]; then
     [ -t 0 ] || _DS_DIE_CODE=3 ds_die "нет терминала для подтверждения. Владелец запускает сам; Claude добавляет --yes только по прямой просьбе владельца"
-    printf 'Выкатить на ПРОД? Для подтверждения введите имя репозитория (%s): ' "$DS_REPO_NAME"
-    read -r ok
+    printf 'Выкатить на ПРОД? Для подтверждения введите имя репозитория (%s) в течение 5 минут: ' "$DS_REPO_NAME"
+    ok=""
+    read -r -t 300 ok || true
     if [ "$ok" != "$DS_REPO_NAME" ]; then
       for t in "${_DS_SEL[@]}"; do _ds_journal "$t" "$DS_REEXEC" "cancelled"; done
       _DS_DIE_CODE=3 ds_die "не подтверждено — ничего не выкачено"
@@ -1159,21 +1362,28 @@ ds_main() {
     rc=$_DS_APPLY_RC
     case "$rc" in
       0)
-        if declare -F "ds_${t}_health" >/dev/null; then
-          set +e; (set -e; "ds_${t}_health"); rc=$?; set -e
-          if [ "$rc" != 0 ]; then
-            ds_warn "$t: проверка здоровья с ПК (ds_${t}_health) не прошла"
-            _ds_journal "$t" "$DS_SHA" "health-failed(pc)"; code=5; failed="$t"; break
-          fi
-        fi
         if [ "$DS_MODE" = adopt-verify ]; then
           _ds_journal "$t" "$DS_SHA" "adopted"
           ds_info "✓ $t: маркер поставлен на ${DS_SHA:0:9} (файлы и сервисы не трогались)"
-        else
-          _ds_journal "$t" "$DS_SHA" "ok"
-          ds_info "✓ $t: выкачено ${DS_SHA:0:9}"
-        fi ;;
-      20|21|23|24|30)
+          continue
+        fi
+        if [ "$DS_PC_HEALTH" = 1 ]; then
+          set +e; (set -e; "ds_${t}_health"); rc=$?; set -e
+          if [ "$rc" != 0 ]; then
+            ds_warn "$t: проверка здоровья с ПК (ds_${t}_health) не прошла"
+            _ds_finalize_target "$t" health-failed
+            [ "$_DS_APPLY_RC" = 0 ] || ds_warn "$t: не удалось записать итог в маркер (там result=server-ok)"
+            _ds_journal "$t" "$DS_SHA" "health-failed(pc)"; code=5; failed="$t"; break
+          fi
+          _ds_finalize_target "$t" ok
+          if [ "$_DS_APPLY_RC" != 0 ]; then
+            ds_warn "$t: код выложен и здоров, но итог ok не записан в маркер (там result=server-ok) — повторите выкатку"
+            _ds_journal "$t" "$DS_SHA" "finalize-failed($_DS_APPLY_RC)"; code=4; failed="$t"; break
+          fi
+        fi
+        _ds_journal "$t" "$DS_SHA" "ok"
+        ds_info "✓ $t: выкачено ${DS_SHA:0:9}" ;;
+      20|21|23|24|25|30)
         _ds_journal "$t" "$DS_SHA" "refused-remote($rc)"
         ds_warn "$t: сервер отказал (код $rc) — файлы не менялись"; code=3; failed="$t"; break ;;
       32)
