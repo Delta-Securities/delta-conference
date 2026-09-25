@@ -1,0 +1,8 @@
+# --- стандарт деплоя Delta Securities: скрипты и юниты всегда с LF ---
+# (на ПК владельца core.autocrlf=true: без этого .sh получают CRLF и падают в bash)
+*.sh text eol=lf
+scripts/lib/known_hosts text eol=lf
+deploy/systemd/* text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+# .bat/.cmd не трогать — им нужен CRLF
