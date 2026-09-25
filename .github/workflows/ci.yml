@@ -46,7 +46,7 @@ jobs:
           done
           grep -m1 '^DS_DEPLOY_LIB_VERSION=' scripts/lib/ds-deploy.sh
           # библиотека побайтно равна эталону стандарта (новая версия — PR во все репо)
-          echo "a3831fcb081b390e71fef0e6a513ee3c5880264d618fd3a4df82e0f165431f09  scripts/lib/ds-deploy.sh" | sha256sum -c -
+          echo "4a02261ecda34fd208cbd3a7ac900cac82df94122051fc4a88d71f15b241d9ca  scripts/lib/ds-deploy.sh" | sha256sum -c -
 
   # Next.js 16 (статический экспорт в out/): lint + build.
   next-site:

@@ -1,10 +1,10 @@
 # Деплой delta-conference
 
-Проект следует общему стандарту деплоя Delta Securities: `scripts/lib/DEPLOY_STANDARD.md`, библиотека `scripts/lib/ds-deploy.sh` версии 1.2.0. Здесь — только факты этого проекта. Правила для сессий Claude — в блоке «Изменения и деплой» в `CLAUDE.md`.
+Проект следует общему стандарту деплоя Delta Securities: `scripts/lib/DEPLOY_STANDARD.md`, библиотека `scripts/lib/ds-deploy.sh` версии 1.3.0. Здесь — только факты этого проекта. Правила для сессий Claude — в блоке «Изменения и деплой» в `CLAUDE.md`.
 
 Репозиторий **публичный**: здесь не пишем адреса серверов, логины, пути на ПК и ничего секретного.
 
-Обновлено: 24.09.2026.
+Обновлено: 25.09.2026.
 
 ## Коротко
 
@@ -22,8 +22,9 @@
 
 1. Ветка `<тип>/<кратко>` от `master`, затем PR в `master`. Прямой push в `master` запрещён.
 2. CI (`.github/workflows/ci.yml`, проверка `ci`: shellcheck, сверка библиотеки деплоя, `npm ci`, `npm run lint`, `npm run build`) должен быть зелёным.
-3. Мержит только владелец, или Claude по его прямой просьбе:
+3. Мержит владелец:
    `gh pr merge <N> --repo Delta-Securities/delta-conference --merge --admin`
+   Claude не мержит (запрещено в настройках владельца) — готовит эту команду с номером PR.
 4. Мерж ничего не публикует: автопубликации по push нет (Netlify/Vercel к репозиторию не подключены, вебхуков нет — проверено 24.09.2026).
 
 ## Где прод
@@ -45,5 +46,5 @@
 
 ## Стандарт коротко
 
-- В `master` — только через PR. Мерж: `gh pr merge <N> --repo Delta-Securities/delta-conference --merge --admin`, без `--squash`, `--rebase` и `--delete-branch`.
+- В `master` — только через PR. Мерж делает владелец: `gh pr merge <N> --repo Delta-Securities/delta-conference --merge --admin`, без `--squash`, `--rebase` и `--delete-branch`.
 - Когда появится прод: только `scripts/deploy.sh prod` — выкатывается `origin/master` с зелёным `ci`, из `git archive`. Рабочая копия и текущая ветка не важны.
